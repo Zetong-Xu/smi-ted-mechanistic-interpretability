@@ -15,20 +15,18 @@ experiments to SMI-TED.
 
 ## Repository Structure
 
+```
 smi-ted-mechanistic-interpretability/
-│
 ├── molformer/
 │   ├── original/          # Original MOLFormer code (unmodified)
 │   └── fixed/             # Version with identified bugs fixed
-│
 ├── smi_ted/               # SMI-TED experiments (main work)
-│
-├── results/               # Experiment results
+├── results/
 │   ├── molformer/
 │   └── smi_ted/
-│
 ├── CHANGES.md             # Documented bugs and migration changes
 └── README.md
+```
 
 ## Experiments
 
