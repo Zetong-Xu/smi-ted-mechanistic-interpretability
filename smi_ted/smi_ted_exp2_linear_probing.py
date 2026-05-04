@@ -1,29 +1,19 @@
 """
 Experiment 2: Linear Probing for Chemical Properties — SMI-TED
 ==============================================================
-Standalone script extracted from the full mechanistic interpretability
-pipeline. Modifications from the original:
-  1. Separate figure per probing task (accuracy only, no F1 plot)
-  2. Random-input activation baseline added to every plot
-  3. Molecule-level 80/20 train/test split (no data leakage)
+Standalone script. Changes from previous version:
+  1. 8 atom properties (added hybridization, chiral_tag,
+     formal_charge, total_valence)
+  2. Frequency baseline (DummyClassifier, most_frequent)
+  3. Random-input activation baseline (both retained)
+  4. One figure per property, unified y-axis (0–1)
+  5. Molecule-level 80/20 train/test split (no data leakage)
 
-Note: Experiment 1 (Attention-Distance Correlation) is not applicable
-to SMI-TED because it uses linear attention (FAVOR+) which does not
-produce explicit attention matrices.
+Note: Experiment 1 (Attention-Distance Correlation) is skipped.
+SMI-TED uses linear attention (FAVOR+) — no explicit attention matrices.
 
-Bugs fixed from original MOLFormer code carried forward to this script:
-  - Molecule-level train/test split (was atom-level, causing leakage)
-  - Ablation hook on inner_attention (not used here, but noted)
-
-SMI-TED-specific changes vs MOLFormer:
-  - Model loading: load_smi_ted() instead of HuggingFace AutoModel
-  - Token-to-atom mapping: SMI-TED regex + canonicalization
-  - Hook paths: model.encoder.tok_emb and
-                model.encoder.blocks.layers[i]
-  - Forward pass: model.tokenize() + model.encoder()
-
-Requires: torch, rdkit, numpy, pandas, sklearn, matplotlib, seaborn,
-          regex, smi_ted_light (local)
+Requires: torch, rdkit, numpy, pandas, sklearn, matplotlib, regex,
+          smi_ted_light (local)
 """
 
 import os
@@ -40,6 +30,7 @@ import pandas as pd
 import torch
 import regex as re
 from sklearn.linear_model import LogisticRegression
+from sklearn.dummy import DummyClassifier
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
@@ -60,11 +51,10 @@ from rdkit import Chem
 SEED   = 42
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-SMI_TED_PATH  = '/Users/xuzetong/projects/materials/models/smi_ted/inference'
+SMI_TED_PATH  = '/home/zetong/smi_ted_inference/inference'
 CKPT_FILENAME = 'smi-ted-Light_40.pt'
-
-QM9_PATH  = ('/Users/xuzetong/projects/materials/models/smi_ted'
-             '/finetune/moleculenet/qm9/qm9_small_test.csv')
+QM9_PATH      = ('/home/zetong/smi-ted-mechanistic-interpretability'
+                 '/datasets/qm9/qm9_test.csv')
 
 RESULTS_DIR = Path('./results/smi_ted')
 FIGURES_DIR = RESULTS_DIR / 'figures'
@@ -100,10 +90,6 @@ ATOM_PATTERN = re.compile(
 # ─────────────────────────────────────────────────────────────────────
 
 def load_model_and_tokenizer():
-    """
-    Load SMI-TED model via load_smi_ted().
-    Tokenizer is accessed as model.tokenizer.
-    """
     sys.path.insert(0, SMI_TED_PATH)
     from smi_ted_light.load import load_smi_ted
 
@@ -137,15 +123,8 @@ def load_qm9_data(n_samples=1000):
 def get_atom_indices_from_smiles(smiles):
     """
     Map SMILES tokens to RDKit atom indices using SMI-TED's official
-    regex pattern.
-
-    Canonicalizes SMILES (isomericSmiles=False) to match SMI-TED's
-    internal normalize_smiles() call, so token order and RDKit atom
-    numbering agree.
-
-    Returns:
-        atom_map : list[int]  — atom index per token, -1 for non-atoms
-        mol      : RDKit Mol  — canonical molecule object
+    regex pattern. Canonicalizes SMILES to match SMI-TED's internal
+    normalize_smiles() call.
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -177,16 +156,20 @@ def get_atom_indices_from_smiles(smiles):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Atom Properties
+# Atom Properties — 8 properties
 # ─────────────────────────────────────────────────────────────────────
 
 def get_atom_properties(mol):
-    """Extract 4 chemical properties for each atom."""
+    """Extract 8 chemical properties for each atom."""
     return [{
-        'atom_type':   atom.GetSymbol(),
-        'is_aromatic': atom.GetIsAromatic(),
-        'is_in_ring':  atom.IsInRing(),
-        'degree':      atom.GetDegree(),
+        'atom_type':     atom.GetSymbol(),
+        'hybridization': str(atom.GetHybridization()),
+        'is_aromatic':   atom.GetIsAromatic(),
+        'is_in_ring':    atom.IsInRing(),
+        'chiral_tag':    str(atom.GetChiralTag()),
+        'degree':        atom.GetDegree(),
+        'formal_charge': atom.GetFormalCharge(),
+        'total_valence': atom.GetTotalValence(),
     } for atom in mol.GetAtoms()]
 
 
@@ -197,7 +180,6 @@ def get_atom_properties(mol):
 def register_hooks(model):
     """
     Register forward hooks on SMI-TED encoder layers.
-
     Layer 0  : model.encoder.tok_emb
     Layers 1-12: model.encoder.blocks.layers[i]
     """
@@ -234,18 +216,13 @@ def extract_hidden_states_per_layer(model, smiles_list,
                                      max_molecules=800,
                                      use_random_input=False):
     """
-    Extract hidden states from all 13 layers (embedding + 12 encoder
-    layers) at atom token positions.
+    Extract hidden states from all 13 layers at atom token positions.
 
     If use_random_input=True, the tok_emb output is replaced with
-    random Gaussian noise before being passed through the encoder.
-    This produces a random-input activation baseline for linear probing.
-
-    Forward pass uses model.tokenize() + model.encoder() (SMI-TED API).
+    random Gaussian noise (random-input activation baseline).
     """
     hooks, intermediate = register_hooks(model)
 
-    # Random-input baseline: replace tok_emb output with noise
     random_hooks = []
     if use_random_input:
         def randomize_hook(module, input, output):
@@ -272,13 +249,11 @@ def extract_hidden_states_per_layer(model, smiles_list,
 
         props = get_atom_properties(mol_obj)
 
-        # SMI-TED forward pass
         idx, mask = model.tokenize(smi)
         intermediate.clear()
         with torch.no_grad():
             _ = model.encoder(idx, mask)
 
-        # +1 offset for <bos> token
         full_atom_map      = [-1] + atom_map + [-1]
         atom_token_indices = [i for i, a in enumerate(full_atom_map)
                               if a >= 0]
@@ -293,7 +268,7 @@ def extract_hidden_states_per_layer(model, smiles_list,
                 break
             hs = intermediate[layer_idx]
             if hs.dim() == 3:
-                hs = hs[0]          # remove batch dim -> (seq_len, 768)
+                hs = hs[0]
             if max(atom_token_indices) >= hs.shape[0]:
                 success = False
                 break
@@ -334,26 +309,26 @@ def extract_hidden_states_per_layer(model, smiles_list,
 def run_linear_probing(layer_embeddings, atom_labels,
                         layer_embeddings_random=None):
     """
-    Train logistic regression probes for 4 chemical properties at
-    each of the 13 layers.
+    Train logistic regression probes for 8 chemical properties.
 
-    Uses molecule-level 80/20 train/test split to prevent data leakage
-    (atoms from the same molecule never appear in both splits).
-
-    If layer_embeddings_random is provided, trains a parallel probe on
-    random-input activations and records accuracy_random per layer.
+    Three baselines recorded per property:
+      - frequency_baseline : DummyClassifier(most_frequent)
+      - accuracy_random    : probe on random-input activations
     """
     df_labels = pd.DataFrame(atom_labels)
 
     probing_tasks = {
-        'atom_type':   df_labels['atom_type'].values,
-        'is_aromatic': df_labels['is_aromatic'].astype(int).values,
-        'is_in_ring':  df_labels['is_in_ring'].astype(int).values,
-        'degree':      df_labels['degree'].values,
+        'atom_type':     df_labels['atom_type'].values,
+        'hybridization': df_labels['hybridization'].values,
+        'is_aromatic':   df_labels['is_aromatic'].astype(int).values,
+        'is_in_ring':    df_labels['is_in_ring'].astype(int).values,
+        'chiral_tag':    df_labels['chiral_tag'].values,
+        'degree':        df_labels['degree'].values,
+        'formal_charge': df_labels['formal_charge'].values,
+        'total_valence': df_labels['total_valence'].values,
     }
 
-    # Molecule-level split — shared across all tasks and both
-    # normal/random embeddings so comparisons are fair
+    # Molecule-level 80/20 split — shared across all tasks
     molecule_indices = df_labels['molecule_idx'].values
     unique_mols      = np.unique(molecule_indices)
     rng              = np.random.default_rng(SEED)
@@ -377,6 +352,15 @@ def run_linear_probing(layer_embeddings, atom_labels,
             print("  Skipped (fewer than 2 classes in training set)")
             continue
 
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        # Frequency baseline
+        dummy = DummyClassifier(strategy='most_frequent')
+        dummy.fit(np.zeros((len(train_idx), 1)), y_train)
+        freq_acc = accuracy_score(
+            y_test, dummy.predict(np.zeros((len(test_idx), 1))))
+        print(f"  Frequency baseline: {freq_acc:.4f}")
+
         task_results = {}
 
         for layer_idx in sorted(layer_embeddings.keys()):
@@ -385,7 +369,6 @@ def run_linear_probing(layer_embeddings, atom_labels,
                 continue
 
             X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
 
             clf = LogisticRegression(max_iter=1000, random_state=SEED,
                                      n_jobs=-1, C=1.0)
@@ -394,7 +377,11 @@ def run_linear_probing(layer_embeddings, atom_labels,
 
             acc = accuracy_score(y_test, y_pred)
             f1  = f1_score(y_test, y_pred, average='weighted')
-            entry = {'accuracy': acc, 'f1': f1}
+            entry = {
+                'accuracy':           acc,
+                'f1':                 f1,
+                'frequency_baseline': freq_acc,
+            }
 
             # Random-input baseline probe
             if layer_embeddings_random is not None:
@@ -404,9 +391,8 @@ def run_linear_probing(layer_embeddings, atom_labels,
                                                random_state=SEED,
                                                n_jobs=-1, C=1.0)
                     clf_r.fit(X_r[train_idx], y_train)
-                    y_pred_r = clf_r.predict(X_r[test_idx])
                     entry['accuracy_random'] = accuracy_score(
-                        y_test, y_pred_r)
+                        y_test, clf_r.predict(X_r[test_idx]))
 
             task_results[layer_idx] = entry
 
@@ -426,18 +412,20 @@ def run_linear_probing(layer_embeddings, atom_labels,
 
 def plot_probing_results(probing_results):
     """
-    One separate figure per probing task, accuracy only.
-    Each figure shows two curves:
-      - Model activations (solid)
-      - Random-input baseline (dashed), if available
+    One figure per property. Each figure shows:
+      - Model activations        (solid blue)
+      - Random-input baseline    (dashed gray)
+      - Frequency baseline       (dotted red horizontal line)
+    All figures share unified y-axis (0 to 1).
     """
     for task_name, task_res in probing_results.items():
         fig, ax = plt.subplots(figsize=(8, 5))
 
         layers = sorted(task_res.keys())
         accs   = [task_res[l]['accuracy'] for l in layers]
+
         ax.plot(layers, accs, marker='o', linewidth=2,
-                label='Model activations')
+                color='steelblue', label='Model activations')
 
         if 'accuracy_random' in task_res[layers[0]]:
             accs_r = [task_res[l]['accuracy_random'] for l in layers]
@@ -445,12 +433,19 @@ def plot_probing_results(probing_results):
                     linestyle='--', color='gray',
                     label='Random input baseline')
 
+        freq_acc = task_res[layers[0]]['frequency_baseline']
+        ax.axhline(freq_acc, linestyle=':', linewidth=2,
+                   color='tomato',
+                   label=f'Frequency baseline ({freq_acc:.2f})')
+
         ax.set_xlabel('Layer', fontsize=12)
         ax.set_ylabel('Accuracy', fontsize=12)
-        ax.set_title(f'SMI-TED Linear Probe Accuracy: {task_name}',
-                     fontsize=13)
+        ax.set_title(
+            f'SMI-TED Linear Probe Accuracy: {task_name}',
+            fontsize=13)
         ax.set_xticks(range(13))
-        ax.legend()
+        ax.set_ylim(0, 1)
+        ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -477,6 +472,10 @@ def main():
     print("does not produce explicit attention matrices.")
     print("=" * 70)
 
+    # Add fast_transformers to path
+    sys.path.insert(
+        0, os.path.join(SMI_TED_PATH, 'smi_ted_light'))
+
     model, tokenizer = load_model_and_tokenizer()
 
     qm9_df      = load_qm9_data(n_samples=1000)
@@ -486,9 +485,7 @@ def main():
     layer_embeddings, atom_labels = extract_hidden_states_per_layer(
         model, smiles_list, max_molecules=800)
 
-    # Random-input baseline activations
-    # atom_labels from random run discarded (_) — molecule set and
-    # split must match the normal run exactly
+    # Random-input baseline
     layer_embeddings_random, _ = extract_hidden_states_per_layer(
         model, smiles_list, max_molecules=800,
         use_random_input=True)
