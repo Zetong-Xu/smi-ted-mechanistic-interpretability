@@ -289,6 +289,10 @@ def run_linear_probing(layer_embeddings, atom_labels,
         print(f"  Classes: {le.classes_}")
 
         y_train, y_test = y[train_idx], y[test_idx]
+        # Skip if only one class
+        if len(np.unique(y_train)) < 2:
+            print(f"  Skipped (only one class in training set)")
+            continue
 
         # Frequency baseline
         dummy = DummyClassifier(strategy='most_frequent')
