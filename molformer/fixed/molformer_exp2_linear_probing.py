@@ -1,18 +1,18 @@
 """
 Experiment 2: Linear Probing for Chemical Properties — MOLFormer
 ================================================================
-Standalone script extracted from the full mechanistic interpretability
-pipeline. Modifications from the original:
-  1. Separate figure per probing task (accuracy only, no F1 plot)
-  2. Random-input activation baseline added to every plot
-  3. Molecule-level 80/20 train/test split (no data leakage)
+Standalone script. Changes from previous version:
+  1. 8 atom properties (added hybridization, chiral_tag,
+     formal_charge, total_valence)
+  2. Frequency baseline (DummyClassifier, most_frequent)
+  3. Random-input activation baseline (both retained)
+  4. One figure per property, unified y-axis (0–1)
+  5. Molecule-level 80/20 train/test split (no data leakage)
 
 Requires: transformers==4.34.0, torch, rdkit, numpy, pandas,
-          sklearn, matplotlib, seaborn
+          sklearn, matplotlib
 """
 
-import os
-import sys
 import json
 import random
 import warnings
@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.linear_model import LogisticRegression
+from sklearn.dummy import DummyClassifier
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
@@ -45,7 +46,7 @@ from rdkit import Chem
 SEED   = 42
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-WORKSPACE   = Path('.')          # adjust if needed
+WORKSPACE   = Path('.')
 RESULTS_DIR = WORKSPACE / 'results' / 'molformer'
 FIGURES_DIR = RESULTS_DIR / 'figures'
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,16 +124,20 @@ def get_atom_indices_from_smiles(smiles, tokenizer):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Atom Properties
+# Atom Properties — 8 properties
 # ─────────────────────────────────────────────────────────────────────
 
 def get_atom_properties(mol):
-    """Extract 4 chemical properties for each atom."""
+    """Extract 8 chemical properties for each atom."""
     return [{
-        'atom_type':   atom.GetSymbol(),
-        'is_aromatic': atom.GetIsAromatic(),
-        'is_in_ring':  atom.IsInRing(),
-        'degree':      atom.GetDegree(),
+        'atom_type':     atom.GetSymbol(),
+        'hybridization': str(atom.GetHybridization()),
+        'is_aromatic':   atom.GetIsAromatic(),
+        'is_in_ring':    atom.IsInRing(),
+        'chiral_tag':    str(atom.GetChiralTag()),
+        'degree':        atom.GetDegree(),
+        'formal_charge': atom.GetFormalCharge(),
+        'total_valence': atom.GetTotalValence(),
     } for atom in mol.GetAtoms()]
 
 
@@ -141,21 +146,19 @@ def get_atom_properties(mol):
 # ─────────────────────────────────────────────────────────────────────
 
 def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
-                                     max_molecules=2000,
+                                     max_molecules=1000,
                                      use_random_input=False):
     """
-    Extract hidden states from all 13 layers (embedding + 12 encoder
-    layers) at atom token positions.
+    Extract hidden states from all 13 layers at atom token positions.
 
     If use_random_input=True, the embedding output is replaced with
-    random Gaussian noise before being passed through the encoder.
-    This produces a random-input activation baseline for linear probing.
+    random Gaussian noise (random-input activation baseline).
     """
-    layer_outputs  = {i: [] for i in range(13)}
-    atom_labels    = []
-    hooks          = []
-    random_hooks   = []
-    intermediate   = {}
+    layer_outputs = {i: [] for i in range(13)}
+    atom_labels   = []
+    hooks         = []
+    random_hooks  = []
+    intermediate  = {}
 
     def make_hook(layer_idx):
         def hook_fn(module, input, output):
@@ -165,7 +168,6 @@ def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
                 intermediate[layer_idx] = output.detach().cpu()
         return hook_fn
 
-    # Hook embedding (layer 0) and each encoder layer (layers 1-12)
     if hasattr(model, 'embeddings'):
         hooks.append(
             model.embeddings.register_forward_hook(make_hook(0)))
@@ -174,7 +176,6 @@ def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
         for i, layer in enumerate(model.encoder.layer):
             hooks.append(layer.register_forward_hook(make_hook(i + 1)))
 
-    # Random-input baseline: replace embedding output with random noise
     if use_random_input and hasattr(model, 'embeddings'):
         def randomize_hook(module, input, output):
             if isinstance(output, tuple):
@@ -184,7 +185,8 @@ def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
             model.embeddings.register_forward_hook(randomize_hook))
 
     processed = 0
-    desc = "Extracting hidden states" + (" (random)" if use_random_input else "")
+    desc = ("Extracting hidden states"
+            + (" (random)" if use_random_input else ""))
 
     for smi in tqdm(smiles_list, desc=desc):
         mol = Chem.MolFromSmiles(smi)
@@ -205,7 +207,6 @@ def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
         with torch.no_grad():
             _ = model(**inputs, output_attentions=False)
 
-        # +1 offset for <bos> token
         full_atom_map      = [-1] + atom_map + [-1]
         atom_token_indices = [i for i, a in enumerate(full_atom_map)
                               if a >= 0]
@@ -214,7 +215,7 @@ def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
             continue
 
         for layer_idx in intermediate:
-            hs      = intermediate[layer_idx][0]   # (seq_len, 768)
+            hs      = intermediate[layer_idx][0]
             atom_hs = hs[atom_token_indices].numpy()
             layer_outputs[layer_idx].append(atom_hs)
 
@@ -248,26 +249,26 @@ def extract_hidden_states_per_layer(model, tokenizer, smiles_list,
 def run_linear_probing(layer_embeddings, atom_labels,
                         layer_embeddings_random=None):
     """
-    Train logistic regression probes for 4 chemical properties at
-    each of the 13 layers.
+    Train logistic regression probes for 8 chemical properties.
 
-    Uses molecule-level 80/20 train/test split to prevent data leakage
-    (atoms from the same molecule never appear in both splits).
-
-    If layer_embeddings_random is provided, trains a parallel probe on
-    random-input activations and records accuracy_random per layer.
+    Three baselines recorded per property:
+      - frequency_baseline : DummyClassifier(most_frequent)
+      - accuracy_random    : probe on random-input activations
     """
     df_labels = pd.DataFrame(atom_labels)
 
     probing_tasks = {
-        'atom_type':   df_labels['atom_type'].values,
-        'is_aromatic': df_labels['is_aromatic'].astype(int).values,
-        'is_in_ring':  df_labels['is_in_ring'].astype(int).values,
-        'degree':      df_labels['degree'].values,
+        'atom_type':     df_labels['atom_type'].values,
+        'hybridization': df_labels['hybridization'].values,
+        'is_aromatic':   df_labels['is_aromatic'].astype(int).values,
+        'is_in_ring':    df_labels['is_in_ring'].astype(int).values,
+        'chiral_tag':    df_labels['chiral_tag'].values,
+        'degree':        df_labels['degree'].values,
+        'formal_charge': df_labels['formal_charge'].values,
+        'total_valence': df_labels['total_valence'].values,
     }
 
-    # Molecule-level split — shared across all tasks and both
-    # normal/random embeddings so comparisons are fair
+    # Molecule-level 80/20 split — shared across all tasks
     molecule_indices = df_labels['molecule_idx'].values
     unique_mols      = np.unique(molecule_indices)
     rng              = np.random.default_rng(SEED)
@@ -287,6 +288,15 @@ def run_linear_probing(layer_embeddings, atom_labels,
         y  = le.fit_transform(labels)
         print(f"  Classes: {le.classes_}")
 
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        # Frequency baseline
+        dummy = DummyClassifier(strategy='most_frequent')
+        dummy.fit(np.zeros((len(train_idx), 1)), y_train)
+        freq_acc = accuracy_score(
+            y_test, dummy.predict(np.zeros((len(test_idx), 1))))
+        print(f"  Frequency baseline: {freq_acc:.4f}")
+
         task_results = {}
 
         for layer_idx in sorted(layer_embeddings.keys()):
@@ -295,7 +305,6 @@ def run_linear_probing(layer_embeddings, atom_labels,
                 continue
 
             X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
 
             clf = LogisticRegression(max_iter=1000, random_state=SEED,
                                      n_jobs=-1, C=1.0)
@@ -304,7 +313,11 @@ def run_linear_probing(layer_embeddings, atom_labels,
 
             acc = accuracy_score(y_test, y_pred)
             f1  = f1_score(y_test, y_pred, average='weighted')
-            entry = {'accuracy': acc, 'f1': f1}
+            entry = {
+                'accuracy':           acc,
+                'f1':                 f1,
+                'frequency_baseline': freq_acc,
+            }
 
             # Random-input baseline probe
             if layer_embeddings_random is not None:
@@ -314,9 +327,8 @@ def run_linear_probing(layer_embeddings, atom_labels,
                                                random_state=SEED,
                                                n_jobs=-1, C=1.0)
                     clf_r.fit(X_r[train_idx], y_train)
-                    y_pred_r = clf_r.predict(X_r[test_idx])
                     entry['accuracy_random'] = accuracy_score(
-                        y_test, y_pred_r)
+                        y_test, clf_r.predict(X_r[test_idx]))
 
             task_results[layer_idx] = entry
 
@@ -336,18 +348,20 @@ def run_linear_probing(layer_embeddings, atom_labels,
 
 def plot_probing_results(probing_results):
     """
-    One separate figure per probing task, accuracy only.
-    Each figure shows two curves:
-      - Model activations (solid)
-      - Random-input baseline (dashed), if available
+    One figure per property. Each figure shows:
+      - Model activations        (solid blue)
+      - Random-input baseline    (dashed gray)
+      - Frequency baseline       (dotted red horizontal line)
+    All figures share unified y-axis (0 to 1).
     """
     for task_name, task_res in probing_results.items():
         fig, ax = plt.subplots(figsize=(8, 5))
 
         layers = sorted(task_res.keys())
         accs   = [task_res[l]['accuracy'] for l in layers]
+
         ax.plot(layers, accs, marker='o', linewidth=2,
-                label='Model activations')
+                color='steelblue', label='Model activations')
 
         if 'accuracy_random' in task_res[layers[0]]:
             accs_r = [task_res[l]['accuracy_random'] for l in layers]
@@ -355,12 +369,19 @@ def plot_probing_results(probing_results):
                     linestyle='--', color='gray',
                     label='Random input baseline')
 
+        freq_acc = task_res[layers[0]]['frequency_baseline']
+        ax.axhline(freq_acc, linestyle=':', linewidth=2,
+                   color='tomato',
+                   label=f'Frequency baseline ({freq_acc:.2f})')
+
         ax.set_xlabel('Layer', fontsize=12)
         ax.set_ylabel('Accuracy', fontsize=12)
-        ax.set_title(f'MOLFormer Linear Probe Accuracy: {task_name}',
-                     fontsize=13)
+        ax.set_title(
+            f'MOLFormer Linear Probe Accuracy: {task_name}',
+            fontsize=13)
         ax.set_xticks(range(13))
-        ax.legend()
+        ax.set_ylim(0, 1)
+        ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -391,9 +412,7 @@ def main():
     layer_embeddings, atom_labels = extract_hidden_states_per_layer(
         model, tokenizer, smiles_list, max_molecules=1000)
 
-    # Random-input baseline activations
-    # atom_labels from the random run are discarded (_) because the
-    # molecule set and split must match the normal run exactly
+    # Random-input baseline
     layer_embeddings_random, _ = extract_hidden_states_per_layer(
         model, tokenizer, smiles_list, max_molecules=1000,
         use_random_input=True)
